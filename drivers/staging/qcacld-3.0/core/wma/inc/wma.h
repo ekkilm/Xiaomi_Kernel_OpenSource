@@ -86,6 +86,8 @@
 #endif
 #define WMA_MAX_SUPPORTED_BSS     5
 
+#define WMA_MAX_MGMT_MPDU_LEN 2000
+
 #define FRAGMENT_SIZE 3072
 
 #define MAX_PRINT_FAILURE_CNT 50
@@ -1028,6 +1030,8 @@ typedef struct {
  * @rcpi_req: rcpi request
  * It stores parameters per vdev in wma.
  * @in_bmps : Whether bmps for this interface has been enabled
+ * @vdev_start_wakelock: wakelock to protect vdev start op with firmware
+ * @vdev_stop_wakelock: wakelock to protect vdev stop op with firmware
  */
 struct wma_txrx_node {
 	uint8_t addr[IEEE80211_ADDR_LEN];
@@ -1110,6 +1114,8 @@ struct wma_txrx_node {
 	bool in_bmps;
 	struct beacon_filter_param beacon_filter;
 	bool beacon_filter_enabled;
+	qdf_wake_lock_t vdev_start_wakelock;
+	qdf_wake_lock_t vdev_stop_wakelock;
 };
 
 #if defined(QCA_WIFI_FTM)
@@ -2489,5 +2495,15 @@ QDF_STATUS wma_process_roaming_config(tp_wma_handle wma_handle,
  * Return: None
  */
 void wma_ipa_uc_stat_request(wma_cli_set_cmd_t *privcmd);
+
+/**
+ * wma_configure_smps_params() - Configures the smps parameters to set
+ * @vdev_id: Virtual device for the command
+ * @param_id: SMPS parameter ID
+ * @param_val: Value to be set for the parameter
+ * Return: QDF_STATUS_SUCCESS or non-zero on failure
+ */
+QDF_STATUS wma_configure_smps_params(uint32_t vdev_id, uint32_t param_id,
+							uint32_t param_val);
 
 #endif

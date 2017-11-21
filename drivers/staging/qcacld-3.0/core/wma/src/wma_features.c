@@ -1548,6 +1548,12 @@ int wma_nan_rsp_event_handler(void *handle, uint8_t *event_buf,
 	buf_ptr = (uint8_t *) nan_rsp_event_hdr;
 	alloc_len = sizeof(tSirNanEvent);
 	alloc_len += nan_rsp_event_hdr->data_len;
+	if (nan_rsp_event_hdr->data_len > ((WMI_SVC_MSG_MAX_SIZE -
+	    sizeof(*nan_rsp_event_hdr)) / sizeof(uint8_t))) {
+		WMA_LOGE("excess data length:%d", nan_rsp_event_hdr->data_len);
+		QDF_ASSERT(0);
+		return -EINVAL;
+	}
 	nan_rsp_event = (tSirNanEvent *) qdf_mem_malloc(alloc_len);
 	if (NULL == nan_rsp_event) {
 		WMA_LOGE("%s: Memory allocation failure", __func__);
@@ -3303,13 +3309,23 @@ int wma_wow_wakeup_host_event(void *handle, uint8_t *event,
 
 	qdf_event_set(&wma->wma_resume_event);
 
-	if (param_buf->wow_packet_buffer &&
-	    tlv_check_required(wake_info->wake_reason)) {
+	if (param_buf->wow_packet_buffer) {
 		/*
 		 * In case of wow_packet_buffer, first 4 bytes is the length.
 		 * Following the length is the actual buffer.
 		 */
 		wow_buf_pkt_len = *(uint32_t *)param_buf->wow_packet_buffer;
+		if (wow_buf_pkt_len > (param_buf->num_wow_packet_buffer - 4)) {
+			WMA_LOGE("Invalid wow buf pkt len from firmware, wow_buf_pkt_len: %u, num_wow_packet_buffer: %u",
+				 wow_buf_pkt_len,
+				 param_buf->num_wow_packet_buffer);
+			return -EINVAL;
+		}
+	}
+
+	if (param_buf->wow_packet_buffer &&
+	    tlv_check_required(wake_info->wake_reason)) {
+
 		tlv_hdr = WMITLV_GET_HDR(
 				(uint8_t *)param_buf->wow_packet_buffer + 4);
 
@@ -3343,9 +3359,6 @@ int wma_wow_wakeup_host_event(void *handle, uint8_t *event,
 	case WOW_REASON_BEACON_RECV:
 	case WOW_REASON_ACTION_FRAME_RECV:
 		if (param_buf->wow_packet_buffer) {
-			/* First 4-bytes of wow_packet_buffer is the length */
-			qdf_mem_copy((uint8_t *) &wow_buf_pkt_len,
-				param_buf->wow_packet_buffer, 4);
 			if (wow_buf_pkt_len)
 				wma_wow_dump_mgmt_buffer(
 					param_buf->wow_packet_buffer,
@@ -3420,9 +3433,6 @@ int wma_wow_wakeup_host_event(void *handle, uint8_t *event,
 			break;
 		}
 
-		/* First 4-bytes of wow_packet_buffer is the length */
-		qdf_mem_copy((uint8_t *)&wow_buf_pkt_len,
-			     param_buf->wow_packet_buffer, 4);
 		if (wow_buf_pkt_len == 0) {
 			WMA_LOGE("wow packet buffer is empty");
 			break;
@@ -4120,7 +4130,7 @@ QDF_STATUS wma_enable_wow_in_fw(WMA_HANDLE handle, uint32_t wow_flags)
 			 wmi_get_pending_cmds(wma->wmi_handle));
 		wmi_set_target_suspend(wma->wmi_handle, false);
 		if (!cds_is_driver_recovering()) {
-			cds_trigger_recovery(false);
+			cds_trigger_recovery(CDS_SUSPEND_TIMEOUT);
 		} else {
 			WMA_LOGE("%s: LOGP is in progress, ignore!", __func__);
 		}
@@ -4143,7 +4153,7 @@ QDF_STATUS wma_enable_wow_in_fw(WMA_HANDLE handle, uint32_t wow_flags)
 			 wmi_pending_cmds);
 		htc_dump_counter_info(wma->htc_handle);
 		if (!cds_is_driver_recovering())
-			cds_trigger_recovery(false);
+			cds_trigger_recovery(CDS_SUSPEND_TIMEOUT);
 		else
 			WMA_LOGE("%s: SSR in progress, ignore no credit issue",
 				 __func__);
@@ -4883,7 +4893,7 @@ static QDF_STATUS wma_send_host_wakeup_ind_to_fw(tp_wma_handle wma)
 			 wmi_get_host_credits(wma->wmi_handle));
 		if (!cds_is_driver_recovering()) {
 			wmi_tag_crash_inject(wma->wmi_handle, true);
-			cds_trigger_recovery(false);
+			cds_trigger_recovery(CDS_RESUME_TIMEOUT);
 		} else {
 			WMA_LOGE("%s: SSR in progress, ignore resume timeout",
 				 __func__);
@@ -6873,7 +6883,7 @@ static inline void wma_suspend_target_timeout(bool is_self_recovery_enabled)
 		WMA_LOGE("%s: Module recovering; Ignoring suspend timeout",
 			 __func__);
 	else
-		cds_trigger_recovery(false);
+		cds_trigger_recovery(CDS_SUSPEND_TIMEOUT);
 }
 
 /**
@@ -7043,7 +7053,7 @@ QDF_STATUS wma_resume_target(WMA_HANDLE handle)
 			wmi_get_pending_cmds(wma->wmi_handle),
 			wmi_get_host_credits(wma->wmi_handle));
 		if (!cds_is_driver_recovering()) {
-			cds_trigger_recovery(false);
+			cds_trigger_recovery(CDS_RESUME_TIMEOUT);
 		} else {
 			WMA_LOGE("%s: SSR in progress, ignore resume timeout",
 				__func__);
@@ -8453,6 +8463,11 @@ int wma_p2p_lo_event_handler(void *handle, uint8_t *event_buf,
 	param_tlvs = (WMI_P2P_LISTEN_OFFLOAD_STOPPED_EVENTID_param_tlvs *)
 								event_buf;
 	fix_param = param_tlvs->fixed_param;
+	if (fix_param->vdev_id >= wma->max_bssid) {
+		WMA_LOGE("%s: received invalid vdev_id %d",
+			 __func__, fix_param->vdev_id);
+		return -EINVAL;
+	}
 	event = qdf_mem_malloc(sizeof(*event));
 	if (event == NULL) {
 		WMA_LOGE("Event allocation failed");
@@ -8824,6 +8839,13 @@ int wma_unified_power_debug_stats_event_handler(void *handle,
 		return -EINVAL;
 	}
 
+	if (param_buf->num_debug_register > ((WMI_SVC_MSG_MAX_SIZE -
+		sizeof(wmi_pdev_chip_power_stats_event_fixed_param)) /
+		sizeof(uint32_t))) {
+		WMA_LOGE("excess payload: LEN num_debug_register:%u",
+				param_buf->num_debug_register);
+		return -EINVAL;
+	}
 	debug_registers = param_tlvs->debug_registers;
 	stats_registers_len =
 		(sizeof(uint32_t) * param_buf->num_debug_register);

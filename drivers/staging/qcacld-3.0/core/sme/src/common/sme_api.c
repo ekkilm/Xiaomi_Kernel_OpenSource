@@ -628,7 +628,7 @@ tSmeCmd *sme_get_command_buffer(tpAniSirGlobal pMac)
 				false,
 				pMac->sme.enableSelfRecovery ? true : false);
 		else if (pMac->sme.enableSelfRecovery)
-			cds_trigger_recovery(false);
+			cds_trigger_recovery(CDS_GET_MSG_BUFF_FAILURE);
 		else
 			QDF_BUG(0);
 	}
@@ -2063,7 +2063,7 @@ QDF_STATUS sme_set_plm_request(tHalHandle hHal, tpSirPlmReq pPlmReq)
 	QDF_STATUS status;
 	bool ret = false;
 	tpAniSirGlobal pMac = PMAC_STRUCT(hHal);
-	uint8_t ch_list[WNI_CFG_VALID_CHANNEL_LIST] = { 0 };
+	uint8_t ch_list[WNI_CFG_VALID_CHANNEL_LIST_LEN] = { 0 };
 	uint8_t count, valid_count = 0;
 	cds_msg_t msg;
 	tCsrRoamSession *pSession = CSR_GET_SESSION(pMac, pPlmReq->sessionId);
@@ -3371,7 +3371,7 @@ QDF_STATUS sme_scan_request(tHalHandle hal, uint8_t session_id,
 	tpAniSirGlobal mac_ctx = PMAC_STRUCT(hal);
 	struct ani_scan_req *scan_msg;
 	cds_msg_t msg;
-	uint32_t scan_req_id, scan_count;
+	uint32_t scan_count;
 
 	MTRACE(qdf_trace(QDF_MODULE_ID_SME,
 		 TRACE_CODE_SME_RX_HDD_MSG_SCAN_REQ, session_id,
@@ -3393,8 +3393,6 @@ QDF_STATUS sme_scan_request(tHalHandle hal, uint8_t session_id,
 		sms_log(mac_ctx, LOGE, FL("Max scan reached"));
 		return QDF_STATUS_E_FAILURE;
 	}
-	wma_get_scan_id(&scan_req_id);
-	scan_req->scan_id = scan_req_id;
 
 	status = sme_acquire_global_lock(&mac_ctx->sme);
 	if (!QDF_IS_STATUS_SUCCESS(status)) {
@@ -9083,28 +9081,29 @@ QDF_STATUS sme_update_is_mawc_ini_feature_enabled(tHalHandle hHal,
 
 }
 
-/*--------------------------------------------------------------------------
-   \brief sme_stop_roaming() - Stop roaming for a given sessionId
-   This is a synchronous call
-   \param hHal      - The handle returned by mac_open
-   \param  sessionId - Session Identifier
-   \return QDF_STATUS_SUCCESS on success
-	   Other status on failure
-   \sa
-   --------------------------------------------------------------------------*/
-QDF_STATUS sme_stop_roaming(tHalHandle hHal, uint8_t sessionId, uint8_t reason)
+/**
+ * sme_stop_roaming() - Stop roaming for a given sessionId
+ *  This is a synchronous call
+ *
+ * @hHal      - The handle returned by mac_open
+ * @sessionId - Session Identifier
+ *
+ * Return QDF_STATUS_SUCCESS on success
+ *	   Other status on failure
+ */
+QDF_STATUS sme_stop_roaming(tHalHandle hal, uint8_t session_id, uint8_t reason)
 {
 	tSirMsgQ wma_msg;
 	tSirRetStatus status;
 	tSirRoamOffloadScanReq *req;
-	tpAniSirGlobal mac_ctx = PMAC_STRUCT(hHal);
-	void *wma = cds_get_context(QDF_MODULE_ID_WMA);
+	tpAniSirGlobal mac_ctx = PMAC_STRUCT(hal);
+	tpCsrNeighborRoamControlInfo roam_info;
 
-	if (!wma) {
-		sms_log(mac_ctx, LOGE, "wma is null");
-		return QDF_STATUS_E_NULL_VALUE;
+	if (!CSR_IS_SESSION_VALID(mac_ctx, session_id)) {
+		sme_err("incorrect session/vdev ID");
+		return QDF_STATUS_E_INVAL;
 	}
-
+	roam_info = &mac_ctx->roam.neighborRoamInfo[session_id];
 	req = qdf_mem_malloc(sizeof(*req));
 	if (!req) {
 		sms_log(mac_ctx, LOGE, "failed to allocated memory");
@@ -9116,8 +9115,8 @@ QDF_STATUS sme_stop_roaming(tHalHandle hHal, uint8_t sessionId, uint8_t reason)
 		req->reason = REASON_ROAM_STOP_ALL;
 	else
 		req->reason = REASON_ROAM_SYNCH_FAILED;
-	req->sessionId = sessionId;
-	if (csr_neighbor_middle_of_roaming(mac_ctx, sessionId))
+	req->sessionId = session_id;
+	if (csr_neighbor_middle_of_roaming(mac_ctx, session_id))
 		req->middle_of_roaming = 1;
 	else
 		csr_roam_reset_roam_params(mac_ctx);
@@ -9132,6 +9131,8 @@ QDF_STATUS sme_stop_roaming(tHalHandle hHal, uint8_t sessionId, uint8_t reason)
 		qdf_mem_free(req);
 		return QDF_STATUS_E_FAULT;
 	}
+	roam_info->b_roam_scan_offload_started = false;
+	roam_info->last_sent_cmd = ROAM_SCAN_OFFLOAD_STOP;
 
 	return QDF_STATUS_SUCCESS;
 }
@@ -12036,7 +12037,7 @@ void active_list_cmd_timeout_handle(void *userData)
 
 	if (mac_ctx->sme.enableSelfRecovery) {
 		sme_save_active_cmd_stats(hal);
-		cds_trigger_recovery(false);
+		cds_trigger_recovery(CDS_ACTIVE_LIST_TIMEOUT);
 	} else {
 		if (!mac_ctx->roam.configParam.enable_fatal_event &&
 		   !(cds_is_load_or_unload_in_progress() ||
@@ -16877,24 +16878,31 @@ QDF_STATUS sme_update_sta_roam_policy(tHalHandle hal_handle,
 {
 	tpAniSirGlobal mac_ctx = PMAC_STRUCT(hal_handle);
 	QDF_STATUS status = QDF_STATUS_SUCCESS;
-	tSmeConfigParams sme_config;
+	tSmeConfigParams *sme_config;
 
 	if (!mac_ctx) {
 		QDF_TRACE(QDF_MODULE_ID_SME, QDF_TRACE_LEVEL_FATAL,
 				"%s: mac_ctx is null", __func__);
 		return QDF_STATUS_E_FAILURE;
 	}
-	qdf_mem_zero(&sme_config, sizeof(sme_config));
-	sme_get_config_param(hal_handle, &sme_config);
 
-	sme_config.csrConfig.sta_roam_policy_params.dfs_mode =
+	sme_config = qdf_mem_malloc(sizeof(*sme_config));
+	if (!sme_config) {
+		QDF_TRACE(QDF_MODULE_ID_SME, QDF_TRACE_LEVEL_ERROR,
+			FL("failed to allocate memory for sme_config"));
+		return QDF_STATUS_E_FAILURE;
+	}
+	qdf_mem_zero(sme_config, sizeof(*sme_config));
+	sme_get_config_param(hal_handle, sme_config);
+
+	sme_config->csrConfig.sta_roam_policy_params.dfs_mode =
 		dfs_mode;
-	sme_config.csrConfig.sta_roam_policy_params.skip_unsafe_channels =
+	sme_config->csrConfig.sta_roam_policy_params.skip_unsafe_channels =
 		skip_unsafe_channels;
-	sme_config.csrConfig.sta_roam_policy_params.sap_operating_band =
+	sme_config->csrConfig.sta_roam_policy_params.sap_operating_band =
 		sap_operating_band;
 
-	sme_update_config(hal_handle, &sme_config);
+	sme_update_config(hal_handle, sme_config);
 
 	status = csr_update_channel_list(mac_ctx);
 	if (QDF_STATUS_SUCCESS != status) {
@@ -16905,6 +16913,8 @@ QDF_STATUS sme_update_sta_roam_policy(tHalHandle hal_handle,
 		csr_roam_offload_scan(mac_ctx, session_id,
 				ROAM_SCAN_OFFLOAD_UPDATE_CFG,
 				REASON_ROAM_SCAN_STA_ROAM_POLICY_CHANGED);
+
+	qdf_mem_free(sme_config);
 	return status;
 }
 
@@ -17766,6 +17776,12 @@ QDF_STATUS sme_congestion_register_callback(tHalHandle hal,
 	return status;
 }
 
+QDF_STATUS sme_set_smps_cfg(uint32_t vdev_id, uint32_t param_id,
+						uint32_t param_val)
+{
+	return wma_configure_smps_params(vdev_id, param_id, param_val);
+}
+
 QDF_STATUS sme_ipa_uc_stat_request(tHalHandle hal, uint32_t vdev_id,
 			uint32_t param_id, uint32_t param_val, uint32_t req_cat)
 {
@@ -17794,4 +17810,31 @@ QDF_STATUS sme_ipa_uc_stat_request(tHalHandle hal, uint32_t vdev_id,
 int sme_cli_set_command(int vdev_id, int param_id, int sval, int vpdev)
 {
 	return wma_cli_set_command(vdev_id, param_id, sval, vpdev);
+}
+
+/**
+ * sme_set_vc_mode_config() - Set voltage corner config to FW
+ * @bitmap:	Bitmap that referes to voltage corner config with
+ * different phymode and bw configuration
+ *
+ * Return: QDF_STATUS
+ */
+QDF_STATUS sme_set_vc_mode_config(uint32_t vc_bitmap)
+{
+	void *wma_handle;
+
+	wma_handle = cds_get_context(QDF_MODULE_ID_WMA);
+	if (!wma_handle) {
+		QDF_TRACE(QDF_MODULE_ID_SME, QDF_TRACE_LEVEL_ERROR,
+				"wma_handle is NULL");
+		return QDF_STATUS_E_FAILURE;
+	}
+	if (QDF_STATUS_SUCCESS !=
+		wma_set_vc_mode_config(wma_handle, vc_bitmap)) {
+		QDF_TRACE(QDF_MODULE_ID_SME, QDF_TRACE_LEVEL_ERROR,
+			"%s: Failed to set Voltage Control config to FW",
+			__func__);
+		return QDF_STATUS_E_FAILURE;
+	}
+	return QDF_STATUS_SUCCESS;
 }

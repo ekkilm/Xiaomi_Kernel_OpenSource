@@ -643,7 +643,7 @@ static void hdd_issue_stored_joinreq(hdd_adapter_t *sta_adapter,
 		hdd_context_t *hdd_ctx)
 {
 	tHalHandle hal_handle;
-	uint32_t roam_id;
+	uint32_t roam_id = INVALID_ROAM_ID;
 
 	if (NULL == sta_adapter) {
 		hdd_err("Invalid station adapter, ignore issueing join req");
@@ -654,7 +654,7 @@ static void hdd_issue_stored_joinreq(hdd_adapter_t *sta_adapter,
 	if (true ==  cds_is_sta_connection_pending()) {
 		MTRACE(qdf_trace(QDF_MODULE_ID_HDD,
 				TRACE_CODE_HDD_ISSUE_JOIN_REQ,
-				sta_adapter->sessionId, roam_id));
+				sta_adapter->sessionId, 0));
 		if (QDF_STATUS_SUCCESS !=
 			sme_issue_stored_joinreq(hal_handle,
 				&roam_id,
@@ -1841,6 +1841,11 @@ QDF_STATUS hdd_hostapd_sap_event_cb(tpSap_Event pSapEvent,
 		wlan_hdd_auto_shutdown_enable(pHddCtx, true);
 #endif
 
+		cds_host_diag_log_work(&pHddCtx->sap_wake_lock,
+				       HDD_SAP_WAKE_LOCK_DURATION,
+				       WIFI_POWER_EVENT_WAKELOCK_SAP);
+		qdf_wake_lock_timeout_acquire(&pHddCtx->sap_wake_lock,
+			 HDD_SAP_CLIENT_DISCONNECT_WAKE_LOCK_DURATION);
 		cfg80211_del_sta(dev,
 				 (const u8 *)&pSapEvent->sapevt.
 				 sapStationDisassocCompleteEvent.staMac.
@@ -2352,7 +2357,7 @@ int hdd_softap_set_channel_change(struct net_device *dev, int target_channel,
 	status = wlansap_set_channel_change_with_csa(
 		WLAN_HDD_GET_SAP_CTX_PTR(pHostapdAdapter),
 		(uint32_t)target_channel,
-		target_bw);
+		target_bw, true);
 
 	if (QDF_STATUS_SUCCESS != status) {
 		hdd_err("SAP set channel failed for channel = %d, bw:%d",
@@ -2403,31 +2408,44 @@ void hdd_sap_restart_with_channel_switch(hdd_adapter_t *ap_adapter,
 }
 #endif
 
-int
-static __iw_softap_set_ini_cfg(struct net_device *dev,
-			       struct iw_request_info *info,
-			       union iwreq_data *wrqu, char *extra)
+static int __iw_softap_set_ini_cfg(struct net_device *dev,
+				   struct iw_request_info *info,
+				   union iwreq_data *wrqu,
+				   char *extra)
 {
-	QDF_STATUS vstatus;
-	int ret = 0;            /* success */
-	hdd_adapter_t *pAdapter = (netdev_priv(dev));
-	hdd_context_t *pHddCtx;
+	QDF_STATUS status;
+	int errno;
+	hdd_adapter_t *adapter;
+	hdd_context_t *hdd_ctx;
+	char *value;
+	size_t len;
 
 	ENTER_DEV(dev);
 
-	pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
-	ret = wlan_hdd_validate_context(pHddCtx);
-	if (ret)
-		return ret;
+	adapter = netdev_priv(dev);
+	errno = hdd_validate_adapter(adapter);
+	if (errno)
+		return errno;
 
-	hdd_notice("Received data %s", extra);
+	hdd_ctx = WLAN_HDD_GET_CTX(adapter);
+	errno = wlan_hdd_validate_context(hdd_ctx);
+	if (errno)
+		return errno;
 
-	vstatus = hdd_execute_global_config_command(pHddCtx, extra);
-	if (QDF_STATUS_SUCCESS != vstatus) {
-		ret = -EINVAL;
-	}
+	/* ensure null termination */
+	len = min_t(size_t, wrqu->data.length, QCSAP_IOCTL_MAX_STR_LEN);
+	value = qdf_mem_malloc(len + 1);
+	if (!value)
+		return -ENOMEM;
 
-	return ret;
+	qdf_mem_copy(value, extra, len);
+	hdd_debug("Received data %s", value);
+	status = hdd_execute_global_config_command(hdd_ctx, value);
+	qdf_mem_free(value);
+
+	EXIT();
+
+	return qdf_status_to_os_return(status);
 }
 
 int
@@ -6480,12 +6498,13 @@ static void wlan_hdd_add_hostapd_conf_vsie(hdd_adapter_t *pHostapdAdapter,
 		elem_id = ptr[0];
 		elem_len = ptr[1];
 		left -= 2;
-		if (elem_len > left || elem_len < WPS_OUI_TYPE_SIZE) {
+		if (elem_len > left) {
 			hdd_err("****Invalid IEs eid = %d elem_len=%d left=%d*****",
 				elem_id, elem_len, left);
 			return;
 		}
-		if (IE_EID_VENDOR == elem_id) {
+		if (IE_EID_VENDOR == elem_id &&
+			(elem_len >= WPS_OUI_TYPE_SIZE)) {
 			/* skipping the VSIE's which we don't want to include or
 			 * it will be included by existing code
 			 */
@@ -8026,11 +8045,6 @@ static int __wlan_hdd_cfg80211_stop_ap(struct wiphy *wiphy,
 	pConfig->acs_cfg.acs_mode = false;
 	wlan_hdd_undo_acs(pAdapter);
 	qdf_mem_zero(&pConfig->acs_cfg, sizeof(struct sap_acs_cfg));
-
-	/* Remove the channel no from sap mandatory list if it is a
-	 * 5GHz channel */
-	if (CDS_IS_CHANNEL_5GHZ(pConfig->channel))
-		cds_remove_sap_mandatory_chan(pConfig->channel);
 
 	/* Stop all tx queues */
 	hdd_notice("Disabling queues");

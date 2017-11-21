@@ -1804,6 +1804,48 @@ end:
 	return qdf_status;
 }
 #endif
+
+/**
+ * populate_tx_send_params - Populate TX param TLV for mgmt and offchan tx
+ *
+ * @bufp: Pointer to buffer
+ * @param: Pointer to tx param
+ *
+ * Return: QDF_STATUS_SUCCESS for success and QDF_STATUS_E_FAILURE for failure
+ */
+static inline QDF_STATUS populate_tx_send_params(uint8_t *bufp,
+					 struct tx_send_params param)
+{
+	wmi_tx_send_params *tx_param;
+	QDF_STATUS status = QDF_STATUS_SUCCESS;
+
+	if (!bufp) {
+		status = QDF_STATUS_E_FAILURE;
+		return status;
+	}
+	tx_param = (wmi_tx_send_params *)bufp;
+	WMITLV_SET_HDR(&tx_param->tlv_header,
+		       WMITLV_TAG_STRUC_wmi_tx_send_params,
+		       WMITLV_GET_STRUCT_TLVLEN(wmi_tx_send_params));
+	WMI_TX_SEND_PARAM_PWR_SET(tx_param->tx_param_dword0, param.pwr);
+	WMI_TX_SEND_PARAM_MCS_MASK_SET(tx_param->tx_param_dword0,
+				       param.mcs_mask);
+	WMI_TX_SEND_PARAM_NSS_MASK_SET(tx_param->tx_param_dword0,
+				       param.nss_mask);
+	WMI_TX_SEND_PARAM_RETRY_LIMIT_SET(tx_param->tx_param_dword0,
+					  param.retry_limit);
+	WMI_TX_SEND_PARAM_CHAIN_MASK_SET(tx_param->tx_param_dword1,
+					 param.chain_mask);
+	WMI_TX_SEND_PARAM_BW_MASK_SET(tx_param->tx_param_dword1,
+				      param.bw_mask);
+	WMI_TX_SEND_PARAM_PREAMBLE_SET(tx_param->tx_param_dword1,
+				       param.preamble_type);
+	WMI_TX_SEND_PARAM_FRAME_TYPE_SET(tx_param->tx_param_dword1,
+					 param.frame_type);
+
+	return status;
+}
+
 /**
  *  send_mgmt_cmd_tlv() - WMI scan start function
  *  @wmi_handle      : handle to WMI.
@@ -1820,14 +1862,15 @@ QDF_STATUS send_mgmt_cmd_tlv(wmi_unified_t wmi_handle,
 	uint64_t dma_addr;
 	void *qdf_ctx = param->qdf_ctx;
 	uint8_t *bufp;
-	QDF_STATUS status;
+	QDF_STATUS status = QDF_STATUS_SUCCESS;
 	int32_t bufp_len = (param->frm_len < mgmt_tx_dl_frm_len) ? param->frm_len :
 		mgmt_tx_dl_frm_len;
 
 	cmd_len = sizeof(wmi_mgmt_tx_send_cmd_fixed_param) +
-		WMI_TLV_HDR_SIZE + roundup(bufp_len, sizeof(uint32_t));
+		  WMI_TLV_HDR_SIZE +
+		  roundup(bufp_len, sizeof(uint32_t));
 
-	buf = wmi_buf_alloc(wmi_handle, cmd_len);
+	buf = wmi_buf_alloc(wmi_handle, sizeof(wmi_tx_send_params) + cmd_len);
 	if (!buf) {
 		WMI_LOGE("%s:wmi_buf_alloc failed", __func__);
 		return QDF_STATUS_E_NOMEM;
@@ -1864,9 +1907,21 @@ QDF_STATUS send_mgmt_cmd_tlv(wmi_unified_t wmi_handle,
 #endif
 	cmd->frame_len = param->frm_len;
 	cmd->buf_len = bufp_len;
+	cmd->tx_params_valid = param->tx_params_valid;
 
 	wmi_mgmt_cmd_record(wmi_handle, WMI_MGMT_TX_SEND_CMDID,
 			bufp, cmd->vdev_id, cmd->chanfreq);
+
+	bufp += roundup(bufp_len, sizeof(uint32_t));
+	if (param->tx_params_valid) {
+		status = populate_tx_send_params(bufp, param->tx_param);
+		if (status != QDF_STATUS_SUCCESS) {
+			WMI_LOGE("%s: Populate TX send params failed",
+				 __func__);
+			goto err1;
+		}
+		cmd_len += sizeof(wmi_tx_send_params);
+	}
 
 	if (wmi_unified_cmd_send(wmi_handle, buf, cmd_len,
 				      WMI_MGMT_TX_SEND_CMDID)) {
@@ -3476,8 +3531,8 @@ QDF_STATUS send_set_sta_keep_alive_cmd_tlv(wmi_unified_t wmi_handle,
 		if ((NULL == params->hostv4addr) ||
 			(NULL == params->destv4addr) ||
 			(NULL == params->destmac)) {
-			WMI_LOGE("%s: received null pointer, hostv4addr:%p "
-			   "destv4addr:%p destmac:%p ", __func__,
+			WMI_LOGE("%s: received null pointer, hostv4addr:%pK "
+			   "destv4addr:%pK destmac:%pK ", __func__,
 			   params->hostv4addr, params->destv4addr, params->destmac);
 			wmi_buf_free(buf);
 			return QDF_STATUS_E_FAILURE;
@@ -4891,6 +4946,7 @@ QDF_STATUS send_roam_scan_filter_cmd_tlv(wmi_unified_t wmi_handle,
 	wmi_mac_addr *bssid_dst_ptr = NULL;
 	wmi_ssid *ssid_ptr = NULL;
 	uint32_t *bssid_preferred_factor_ptr = NULL;
+	wmi_roam_lca_disallow_config_tlv_param *blist_param;
 
 	len = sizeof(wmi_roam_filter_fixed_param);
 
@@ -4975,6 +5031,26 @@ QDF_STATUS send_roam_scan_filter_cmd_tlv(wmi_unified_t wmi_handle,
 	}
 	buf_ptr += WMI_TLV_HDR_SIZE +
 		(roam_req->num_bssid_preferred_list * sizeof(uint32_t));
+
+	if (roam_req->lca_disallow_config_present) {
+		WMITLV_SET_HDR(buf_ptr,
+				WMITLV_TAG_ARRAY_STRUC,
+				sizeof(wmi_roam_lca_disallow_config_tlv_param));
+		buf_ptr += WMI_TLV_HDR_SIZE;
+		blist_param =
+			(wmi_roam_lca_disallow_config_tlv_param *) buf_ptr;
+		WMITLV_SET_HDR(&blist_param->tlv_header,
+			WMITLV_TAG_STRUC_wmi_roam_lca_disallow_config_tlv_param,
+			WMITLV_GET_STRUCT_TLVLEN(
+				wmi_roam_lca_disallow_config_tlv_param));
+
+		blist_param->disallow_duration = roam_req->disallow_duration;
+		blist_param->rssi_channel_penalization =
+				roam_req->rssi_channel_penalization;
+		blist_param->num_disallowed_aps = roam_req->num_disallowed_aps;
+		blist_param->disallow_lca_enable_source_bitmap = 0x1;
+		buf_ptr += (sizeof(wmi_roam_lca_disallow_config_tlv_param));
+	}
 
 	status = wmi_unified_cmd_send(wmi_handle, buf,
 		len, WMI_ROAM_FILTER_CMDID);
@@ -9858,8 +9934,8 @@ QDF_STATUS send_set_base_macaddr_indicate_cmd_tlv(wmi_unified_t wmi_handle,
  * Return: 0 on successfully enabling/disabling the events
  */
 QDF_STATUS send_log_supported_evt_cmd_tlv(wmi_unified_t wmi_handle,
-		uint8_t *event,
-		uint32_t len)
+					  uint8_t *event,
+					  uint32_t len)
 {
 	uint32_t num_of_diag_events_logs;
 	wmi_diag_event_log_config_fixed_param *cmd;
@@ -9880,6 +9956,15 @@ QDF_STATUS send_log_supported_evt_cmd_tlv(wmi_unified_t wmi_handle,
 	}
 	wmi_event = param_buf->fixed_param;
 	num_of_diag_events_logs = wmi_event->num_of_diag_events_logs;
+
+	if (num_of_diag_events_logs >
+	    param_buf->num_diag_events_logs_list) {
+		WMI_LOGE("message number of events %d is more than tlv hdr content %d",
+			 num_of_diag_events_logs,
+			 param_buf->num_diag_events_logs_list);
+		return QDF_STATUS_E_INVAL;
+	}
+
 	evt_args = param_buf->diag_events_logs_list;
 	if (!evt_args) {
 		WMI_LOGE("%s: Event list is empty, num_of_diag_events_logs=%d",
@@ -9894,6 +9979,13 @@ QDF_STATUS send_log_supported_evt_cmd_tlv(wmi_unified_t wmi_handle,
 	if (wmi_handle->events_logs_list)
 		qdf_mem_free(wmi_handle->events_logs_list);
 
+	if (num_of_diag_events_logs >
+		(WMI_SVC_MSG_MAX_SIZE / sizeof(uint32_t))) {
+		WMI_LOGE("%s: excess num of logs:%d", __func__,
+			num_of_diag_events_logs);
+		QDF_ASSERT(0);
+		return QDF_STATUS_E_INVAL;
+	}
 	/* Store the event list for run time enable/disable */
 	wmi_handle->events_logs_list = qdf_mem_malloc(num_of_diag_events_logs *
 			sizeof(uint32_t));
